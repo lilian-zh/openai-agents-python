@@ -18,18 +18,15 @@ except ImportError as _e:
     ) from _e
 
 from openai import NOT_GIVEN, AsyncStream, NotGiven
-from openai.types.chat import (
-    ChatCompletionChunk,
-    ChatCompletionMessageFunctionToolCall,
-)
+from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageToolCall
 from openai.types.chat.chat_completion_message import (
     Annotation,
     AnnotationURLCitation,
     ChatCompletionMessage,
 )
-from openai.types.chat.chat_completion_message_function_tool_call import Function
-from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
+from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.responses import Response
+from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 
 from ... import _debug
 from ...agent_output import AgentOutputSchemaBase
@@ -49,12 +46,25 @@ from ...tracing.spans import Span
 from ...usage import Usage
 
 
+# <<< MODIFICATION START: 2. 更新 InternalChatCompletionMessage 的类型注解 >>>
 class InternalChatCompletionMessage(ChatCompletionMessage):
     """
     An internal subclass to carry reasoning_content without modifying the original model.
     """
-
     reasoning_content: str
+    logprobs: list[Logprob] | None
+    # 告诉它 tool_calls 列表将包含我们上面的新类型
+    tool_calls: list[InternalChatCompletionMessageToolCall] | None
+# <<< MODIFICATION END >>>
+
+
+# <<< MODIFICATION START: 1. 定义新的内部工具调用类 >>>
+class InternalChatCompletionMessageToolCall(ChatCompletionMessageToolCall):
+    """
+    一个内部子类，用于携带工具调用特有的logprobs。
+    """
+    logprobs: list[Logprob] | None = None
+# <<< MODIFICATION END >>>
 
 
 class LitellmModel(Model):
@@ -153,7 +163,11 @@ class LitellmModel(Model):
             }
 
             items = Converter.message_to_output_items(
-                LitellmConverter.convert_message_to_openai(response.choices[0].message)
+                LitellmConverter.convert_message_to_openai(
+                    response.choices[0].message, 
+                    # response.choices[0].logprobs
+                    logprobs=getattr(response.choices[0], "logprobs", None)
+                )
             )
 
             return ModelResponse(
@@ -325,7 +339,6 @@ class LitellmModel(Model):
             stream=stream,
             stream_options=stream_options,
             reasoning_effort=reasoning_effort,
-            top_logprobs=model_settings.top_logprobs,
             extra_headers={**HEADERS, **(model_settings.extra_headers or {})},
             api_key=self.api_key,
             base_url=self.base_url,
@@ -361,35 +374,85 @@ class LitellmModel(Model):
 class LitellmConverter:
     @classmethod
     def convert_message_to_openai(
-        cls, message: litellm.types.utils.Message
+        cls,
+        message: litellm.types.utils.Message,
+        logprobs: litellm.types.utils.ChoiceLogprobs | None = None,
     ) -> ChatCompletionMessage:
         if message.role != "assistant":
             raise ModelBehaviorError(f"Unsupported role: {message.role}")
 
-        tool_calls: list[ChatCompletionMessageToolCall] | None = (
-            [LitellmConverter.convert_tool_call_to_openai(tool) for tool in message.tool_calls]
-            if message.tool_calls
-            else None
-        )
+        # <<< MODIFICATION START: 3. 修改此方法的核心逻辑 >>>
+        
+        # 首先，一次性转换所有logprobs
+        full_openai_logprobs = cls.convert_logprobs_to_openai(logprobs) if logprobs else None
 
+        tool_calls_with_logprobs: list[InternalChatCompletionMessageToolCall] | None = None
+        content_logprobs: list[Logprob] | None = None
+
+        if message.tool_calls:
+            # 规则：如果存在工具调用，我们假设所有logprobs都属于它们。
+            # 为简单起见，我们将所有logprobs赋给第一个工具调用。
+            converted_tool_calls = []
+            for i, tool in enumerate(message.tool_calls):
+                # 将完整的logprobs列表赋给第一个工具调用，后续的为空。
+                # 这是一个合理的简化，因为通常一次只会生成一个需要分析的工具调用。
+                current_tool_logprobs = full_openai_logprobs if i == 0 else None
+                converted_tool_calls.append(
+                    cls.convert_tool_call_to_openai(tool, current_tool_logprobs)
+                )
+            tool_calls_with_logprobs = converted_tool_calls
+        else:
+            # 规则：如果没有工具调用，logprobs才属于文本内容。
+            content_logprobs = full_openai_logprobs
+
+        # provider_specific_fields, refusal, reasoning_content 的代码保持不变...
         provider_specific_fields = message.get("provider_specific_fields", None)
         refusal = (
             provider_specific_fields.get("refusal", None) if provider_specific_fields else None
         )
-
         reasoning_content = ""
         if hasattr(message, "reasoning_content") and message.reasoning_content:
             reasoning_content = message.reasoning_content
 
+        # 使用我们新定义的内部类来创建消息对象
         return InternalChatCompletionMessage(
             content=message.content,
             refusal=refusal,
             role="assistant",
             annotations=cls.convert_annotations_to_openai(message),
-            audio=message.get("audio", None),  # litellm deletes audio if not present
-            tool_calls=tool_calls,
+            audio=message.get("audio", None),
+            # 传入带有logprobs的工具调用列表
+            tool_calls=tool_calls_with_logprobs,
             reasoning_content=reasoning_content,
+            # 传入属于文本内容的logprobs
+            logprobs=content_logprobs,
         )
+        # <<< MODIFICATION END >>>
+
+    @classmethod
+    def convert_logprobs_to_openai(
+        cls, logprobs: litellm.types.utils.ChoiceLogprobs | None # <-- 允许None
+    ) -> list[Logprob] | None: # <-- 允许返回None
+        # <<< MODIFICATION START: 4. 使方法更健壮 >>>
+        if not logprobs or not logprobs.content:
+            return None
+        # <<< MODIFICATION END >>>
+        return [
+            Logprob(
+                token=logprob.token,
+                logprob=logprob.logprob,
+                bytes=cast(list[int], logprob.bytes),
+                top_logprobs=[
+                    LogprobTopLogprob(
+                        token=top_logprob.token,
+                        logprob=top_logprob.logprob,
+                        bytes=cast(list[int], top_logprob.bytes),
+                    )
+                    for top_logprob in logprob.top_logprobs
+                ],
+            )
+            for logprob in logprobs.content
+        ]
 
     @classmethod
     def convert_annotations_to_openai(
@@ -416,13 +479,19 @@ class LitellmConverter:
 
     @classmethod
     def convert_tool_call_to_openai(
-        cls, tool_call: litellm.types.utils.ChatCompletionMessageToolCall
-    ) -> ChatCompletionMessageFunctionToolCall:
-        return ChatCompletionMessageFunctionToolCall(
+        cls, 
+        tool_call: litellm.types.utils.ChatCompletionMessageToolCall,
+        # <<< MODIFICATION START: 5. 接收分配好的logprobs >>>
+        assigned_logprobs: list[Logprob] | None
+        # <<< MODIFICATION END >>>
+    ) -> InternalChatCompletionMessageToolCall: # <<< 6. 更改返回类型
+        # <<< MODIFICATION START: 7. 使用新的内部类实例化 >>>
+        return InternalChatCompletionMessageToolCall( # <-- 使用新类
             id=tool_call.id,
             type="function",
             function=Function(
-                name=tool_call.function.name or "",
-                arguments=tool_call.function.arguments,
+                name=tool_call.function.name or "", arguments=tool_call.function.arguments
             ),
+            logprobs=assigned_logprobs, # <-- 传入logprobs
         )
+        # <<< MODIFICATION END >>>

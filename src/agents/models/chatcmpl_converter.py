@@ -12,8 +12,8 @@ from openai.types.chat import (
     ChatCompletionContentPartTextParam,
     ChatCompletionDeveloperMessageParam,
     ChatCompletionMessage,
-    ChatCompletionMessageFunctionToolCallParam,
     ChatCompletionMessageParam,
+    ChatCompletionMessageToolCallParam,
     ChatCompletionSystemMessageParam,
     ChatCompletionToolChoiceOptionParam,
     ChatCompletionToolMessageParam,
@@ -48,6 +48,14 @@ from ..items import TResponseInputItem, TResponseOutputItem
 from ..model_settings import MCPToolChoice
 from ..tool import FunctionTool, Tool
 from .fake_id import FAKE_RESPONSES_ID
+
+
+from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
+class ResponseFunctionToolCallWithLogprobs(ResponseFunctionToolCall):
+    """
+    一个也包含了 logprobs 的 ResponseFunctionToolCall。
+    """
+    logprobs: list[Logprob] | None = None
 
 
 class Converter:
@@ -112,7 +120,12 @@ class Converter:
         )
         if message.content:
             message_item.content.append(
-                ResponseOutputText(text=message.content, type="output_text", annotations=[])
+                ResponseOutputText(
+                    text=message.content,
+                    type="output_text",
+                    annotations=[],
+                    logprobs=getattr(message, "logprobs", None),
+                )
             )
         if message.refusal:
             message_item.content.append(
@@ -126,18 +139,20 @@ class Converter:
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
-                if tool_call.type == "function":
-                    items.append(
-                        ResponseFunctionToolCall(
-                            id=FAKE_RESPONSES_ID,
-                            call_id=tool_call.id,
-                            arguments=tool_call.function.arguments,
-                            name=tool_call.function.name,
-                            type="function_call",
-                        )
+                # <<< MODIFICATION START: 9. 使用新类并传入logprobs >>>
+                items.append(
+                    # 使用我们定义的带有logprobs的响应类
+                    ResponseFunctionToolCallWithLogprobs( 
+                        id=FAKE_RESPONSES_ID,
+                        call_id=tool_call.id,
+                        arguments=tool_call.function.arguments,
+                        name=tool_call.function.name,
+                        type="function_call",
+                        # 从我们传入的内部对象中安全地获取logprobs属性
+                        logprobs=getattr(tool_call, "logprobs", None),
                     )
-                elif tool_call.type == "custom":
-                    pass
+                )
+                # <<< MODIFICATION END >>>
 
         return items
 
@@ -271,16 +286,11 @@ class Converter:
                     raise UserError(
                         f"Only file_data is supported for input_file {casted_file_param}"
                     )
-                if "filename" not in casted_file_param or not casted_file_param["filename"]:
-                    raise UserError(
-                        f"filename must be provided for input_file {casted_file_param}"
-                    )
                 out.append(
                     File(
                         type="file",
                         file=FileFile(
                             file_data=casted_file_param["file_data"],
-                            filename=casted_file_param["filename"],
                         ),
                     )
                 )
@@ -428,7 +438,7 @@ class Converter:
             elif file_search := cls.maybe_file_search_call(item):
                 asst = ensure_assistant_message()
                 tool_calls = list(asst.get("tool_calls", []))
-                new_tool_call = ChatCompletionMessageFunctionToolCallParam(
+                new_tool_call = ChatCompletionMessageToolCallParam(
                     id=file_search["id"],
                     type="function",
                     function={
@@ -448,7 +458,7 @@ class Converter:
                 asst = ensure_assistant_message()
                 tool_calls = list(asst.get("tool_calls", []))
                 arguments = func_call["arguments"] if func_call["arguments"] else "{}"
-                new_tool_call = ChatCompletionMessageFunctionToolCallParam(
+                new_tool_call = ChatCompletionMessageToolCallParam(
                     id=func_call["call_id"],
                     type="function",
                     function={
