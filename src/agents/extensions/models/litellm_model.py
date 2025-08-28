@@ -18,13 +18,25 @@ except ImportError as _e:
     ) from _e
 
 from openai import NOT_GIVEN, AsyncStream, NotGiven
+<<<<<<< HEAD
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageToolCall
+=======
+from openai.types.chat import (
+    ChatCompletionChunk,
+    ChatCompletionMessageCustomToolCall,
+    ChatCompletionMessageFunctionToolCall,
+)
+>>>>>>> upstream/main
 from openai.types.chat.chat_completion_message import (
     Annotation,
     AnnotationURLCitation,
     ChatCompletionMessage,
 )
+<<<<<<< HEAD
 from openai.types.chat.chat_completion_message_tool_call import Function
+=======
+from openai.types.chat.chat_completion_message_function_tool_call import Function
+>>>>>>> upstream/main
 from openai.types.responses import Response
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 
@@ -381,10 +393,20 @@ class LitellmConverter:
         if message.role != "assistant":
             raise ModelBehaviorError(f"Unsupported role: {message.role}")
 
+<<<<<<< HEAD
         # <<< MODIFICATION START: 3. 修改此方法的核心逻辑 >>>
         
         # 首先，一次性转换所有logprobs
         full_openai_logprobs = cls.convert_logprobs_to_openai(logprobs) if logprobs else None
+=======
+        tool_calls: list[
+            ChatCompletionMessageFunctionToolCall | ChatCompletionMessageCustomToolCall
+        ] | None = (
+            [LitellmConverter.convert_tool_call_to_openai(tool) for tool in message.tool_calls]
+            if message.tool_calls
+            else None
+        )
+>>>>>>> upstream/main
 
         tool_calls_with_logprobs: list[InternalChatCompletionMessageToolCall] | None = None
         content_logprobs: list[Logprob] | None = None
